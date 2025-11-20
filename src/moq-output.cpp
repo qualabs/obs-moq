@@ -1,0 +1,100 @@
+#include "moq-output.h"
+
+#include <obs.hpp>
+
+MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
+	: output(output),
+	  server_url(),
+	  token(),
+	  stream_name(),
+	  total_bytes_sent(0),
+	  connect_time_ms(0)
+{
+}
+
+MoQOutput::~MoQOutput()
+{
+	Stop();
+}
+
+bool MoQOutput::Start()
+{
+	return true;
+}
+
+void MoQOutput::Stop(bool signal)
+{
+	if (signal) {
+		return;
+	}
+	return;
+}
+
+void MoQOutput::Data(struct encoder_packet *packet)
+{
+	if (!packet) {
+		Stop(false);
+		obs_output_signal_stop(output, OBS_OUTPUT_ENCODE_ERROR);
+		return;
+	}
+
+	if (packet->type == OBS_ENCODER_AUDIO) {
+		// TODO: Handle Audio packet
+		return;
+	} else if (packet->type == OBS_ENCODER_VIDEO) {
+		// TODO: Handle Video packet
+		return;
+	}
+}
+
+void register_moq_output()
+{
+	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE;
+
+	const char *audio_codecs = "aac";
+	const char *video_codecs = "h264;hevc;av1";
+
+	struct obs_output_info info = {};
+	info.id = "moq_output";
+	info.flags = OBS_OUTPUT_AV | base_flags;
+	info.get_name = [](void *) -> const char * {
+		return "MoQ Output";
+	};
+	info.create = [](obs_data_t *settings, obs_output_t *output) -> void * {
+		return new MoQOutput(settings, output);
+	};
+	info.destroy = [](void *priv_data) {
+		delete static_cast<MoQOutput *>(priv_data);
+	};
+	info.start = [](void *priv_data) -> bool {
+		return static_cast<MoQOutput *>(priv_data)->Start();
+	};
+	info.stop = [](void *priv_data, uint64_t) {
+		static_cast<MoQOutput *>(priv_data)->Stop();
+	};
+	info.encoded_packet = [](void *priv_data, struct encoder_packet *packet) {
+		static_cast<MoQOutput *>(priv_data)->Data(packet);
+	};
+	info.get_total_bytes = [](void *priv_data) -> uint64_t {
+		return (uint64_t)static_cast<MoQOutput *>(priv_data)->GetTotalBytes();
+	};
+	info.get_connect_time_ms = [](void *priv_data) -> int {
+		return static_cast<MoQOutput *>(priv_data)->GetConnectTime();
+	};
+	info.encoded_video_codecs = video_codecs;
+	info.encoded_audio_codecs = audio_codecs;
+	info.protocols = "MoQ";
+
+	obs_register_output(&info);
+
+	info.id = "moq_output_video";
+	info.flags = OBS_OUTPUT_VIDEO | base_flags;
+	info.encoded_audio_codecs = nullptr;
+	obs_register_output(&info);
+
+	info.id = "moq_output_audio";
+	info.flags = OBS_OUTPUT_AUDIO | base_flags;
+	info.encoded_video_codecs = nullptr;
+	info.encoded_audio_codecs = audio_codecs;
+	obs_register_output(&info);
+}
