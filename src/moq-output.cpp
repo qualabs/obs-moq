@@ -19,14 +19,23 @@ MoQOutput::~MoQOutput()
 
 bool MoQOutput::Start()
 {
+	if (!obs_output_can_begin_data_capture(output, 0))
+		return false;
+
+	if (!obs_output_initialize_encoders(output, 0))
+		return false;
+    
+	obs_output_begin_data_capture(output, 0);
+
 	return true;
 }
 
 void MoQOutput::Stop(bool signal)
 {
 	if (signal) {
-		return;
-	}
+		obs_output_signal_stop(output, OBS_OUTPUT_SUCCESS);
+	} 
+
 	return;
 }
 
