@@ -5,7 +5,7 @@
 #include <obs.hpp>
 
 extern "C" {
-    extern void hang_start_from_c();
+    extern void hang_start_from_c(const char *server_url, const char *path, const char *profile);
     extern void hang_stop_from_c();
     extern void hang_write_video_packet_from_c(void *data, size_t size, int keyframe, long dts);
 }
@@ -13,8 +13,7 @@ extern "C" {
 MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	: output(output),
 	  server_url(),
-	  token(),
-	  stream_name(),
+	  path(),
 	  total_bytes_sent(0),
 	  connect_time_ms(0)
 {
@@ -27,12 +26,26 @@ MoQOutput::~MoQOutput()
 
 bool MoQOutput::Start()
 {
+	obs_service_t *service = obs_output_get_service(output);
+	if (!service) {
+		obs_output_signal_stop(output, OBS_OUTPUT_ERROR);
+		return false;
+	}
+    
 	if (!obs_output_can_begin_data_capture(output, 0))
 		return false;
 
 	if (!obs_output_initialize_encoders(output, 0))
 		return false;
 
+	server_url = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_SERVER_URL);
+	if (server_url.empty()) {
+		obs_output_signal_stop(output, OBS_OUTPUT_BAD_PATH);
+		return false;
+	}
+
+	path = obs_service_get_connect_info(service, OBS_SERVICE_CONNECT_INFO_STREAM_KEY);
+    
 	const obs_encoder_t *encoder = obs_output_get_video_encoder2(output, 0);
 
 	if (!encoder)
@@ -41,16 +54,15 @@ bool MoQOutput::Start()
     // std::cout << "joy: " << obs_encoder_get_width(encoder) << std::endl;
 
     obs_data_t *encoder_settings = obs_encoder_get_settings(encoder);
+    const char *profile_str = obs_data_get_string(encoder_settings, "profile");
 
-    // const char *profile_str = obs_data_get_string(encoder_settings, "profile");
+    // std::cout << "json: " << obs_data_get_json_pretty(encoder_settings) << std::endl;
+    
+    // std::cout << "server_url: " << server_url << std::endl;
 
-    // std::cout << "joy: " << profile_str << std::endl;
-
-    std::cout << "json: " << obs_data_get_json_pretty(encoder_settings) << std::endl;
+    hang_start_from_c(server_url.c_str(), path.c_str(), profile_str);
 
     obs_data_release(encoder_settings);
-    
-    hang_start_from_c();
     
 	obs_output_begin_data_capture(output, 0);
 
