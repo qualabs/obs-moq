@@ -83,7 +83,7 @@ bool MoQOutput::Start()
 	// Publish the one broadcast to the session.
 	// NOTE: You could publish multiple broadcasts to the same session if you want (multi ingest).
 	// TODO: There is currently no unpublish function.
-	auto result = hang_session_publish(session, path.c_str(), broadcast);
+	auto result = hang_broadcast_publish(broadcast, session, path.c_str());
 	if (result < 0) {
 		LOG_ERROR("Failed to publish broadcast to session: %d", result);
 		return false;
