@@ -12,7 +12,7 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  server_url(),
 	  path(),
 	  total_bytes_sent(0),
-	  connect_time_ms(0), // TODO: Implement this.
+	  connect_time_ms(0),
 	  session(-1),
 	  video(-1),
 	  audio(-1),
@@ -64,19 +64,34 @@ bool MoQOutput::Start()
 
 	LOG_INFO("Connecting to MoQ server: %s", server_url.c_str());
 
+	// Start establishing a session with the MoQ server
+	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
+	connect_start = std::chrono::steady_clock::now();
+	session = hang_session_connect(server_url.c_str());
+	if (session < 0) {
+		LOG_ERROR("Failed to initialize MoQ server: %d", session);
+		return false;
+	}
+
+	// Create a callback to log when the session is connected
+	auto session_connected_callback = [](void *user_data, int error_code) {
+		auto self = static_cast<MoQOutput*>(user_data);
+		auto elapsed = std::chrono::steady_clock::now() - self->connect_start;
+		self->connect_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
+		LOG_INFO("MoQ session connected in %d ms, error code: %d", self->connect_time_ms, error_code);
+	};
+	hang_session_on_connect(session, session_connected_callback, this);
+
 	// Create a callback to log when the session is closed
 	auto session_closed_callback = [](void *user_data, int error_code) {
 		const char *server_url = (const char *)user_data;
 		LOG_INFO("MoQ session closed: %s, error code: %d", server_url, error_code);
 	};
-
-	// Start establishing a session with the MoQ server
-	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
-	session = hang_session_connect(server_url.c_str(), (void*) server_url.c_str(), session_closed_callback);
-	if (session < 0) {
-		LOG_ERROR("Failed to initialize MoQ server: %d", session);
-		return false;
-	}
+	hang_session_on_close(
+		session,
+		session_closed_callback,
+		(void*) server_url.c_str()
+	);
 
 	LOG_INFO("Publishing broadcast: %s", path.c_str());
 
@@ -97,7 +112,7 @@ bool MoQOutput::Start()
 void MoQOutput::Stop(bool signal)
 {
 	// Close the session
-	hang_session_disconnect(session);
+	hang_session_close(session);
 	hang_track_close(video);
 	hang_track_close(audio);
 
@@ -249,8 +264,10 @@ void register_moq_output()
 {
 	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE;
 
+	// TODO: Add support for other codecs.
 	const char *audio_codecs = "aac";
-	const char *video_codecs = "h264;hevc;av1";
+	// TODO: Add support for other codecs.
+	const char *video_codecs = "h264";
 
 	struct obs_output_info info = {};
 	info.id = "moq_output";

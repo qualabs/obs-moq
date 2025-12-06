@@ -1,6 +1,7 @@
 #pragma once
 #include <obs-module.h>
 
+#include <chrono>
 #include <string>
 #include "logger.h"
 
@@ -30,6 +31,7 @@ private:
 
 	size_t total_bytes_sent;
 	int connect_time_ms;
+	std::chrono::steady_clock::time_point connect_start;
 
 	int session;
 	int broadcast;
