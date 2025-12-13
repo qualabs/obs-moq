@@ -15,11 +15,6 @@ setup path="" preset="":
 
 	PRESET=$(just preset "{{preset}}")
 
-	# Make .deps writable if it exists (fixes xattr permission issues)
-	if [[ -d .deps ]]; then
-		chmod -R u+w .deps
-	fi
-
 	# Add MOQ_LOCAL if path is provided
 	if [[ -n "{{path}}" ]]; then
 		echo "Configuring with preset: $PRESET and MOQ_LOCAL={{path}}"
@@ -35,24 +30,17 @@ build preset="":
 	set -euo pipefail
 
 	PRESET=$(just preset "{{preset}}")
-
 	cmake --build --preset "$PRESET"
 
 # Run the CI checks
 check:
-	#!/usr/bin/env bash
-	set -euo pipefail
-
-	# Check C++ formatting
-	find src -name '*.cpp' -o -name '*.h' | xargs clang-format --dry-run --Werror
+	./build-aux/run-clang-format --check
+	./build-aux/run-gersemi --check
 
 # Automatically fix formatting issues.
 fix:
-	#!/usr/bin/env bash
-	set -euo pipefail
-
-	# Fix C++ formatting
-	find src -name '*.cpp' -o -name '*.h' | xargs clang-format -i
+	./build-aux/run-clang-format --fix
+	./build-aux/run-gersemi --fix
 
 # Detect the appropriate CMake preset for the current platform (or use override)
 preset override="":
