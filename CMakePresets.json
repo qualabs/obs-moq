@@ -14,7 +14,6 @@
         "ENABLE_QT": false,
         "CMAKE_EXPORT_COMPILE_COMMANDS": true,
         "MOQ_VERSION": "0.1.2",
-        "MOQ_LIB": "libmoq.a",
         "MOQ_ARCHIVE": "tar.gz"
       }
     },
@@ -78,7 +77,6 @@
       },
       "cacheVariables": {
         "MOQ_TARGET": "x86_64-pc-windows-msvc",
-        "MOQ_LIB": "moq.lib",
         "MOQ_ARCHIVE": "zip"
       }
     },
