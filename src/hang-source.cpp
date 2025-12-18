@@ -58,9 +58,9 @@ static void on_video_frame(void *user_data, int32_t frame_id);
 
 // Helper functions
 static void hang_source_reconnect(struct hang_source *ctx);
-static void hang_source_disconnect(struct hang_source *ctx);
+static void hang_source_disconnect_locked(struct hang_source *ctx);
 static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_video_config *config);
-static void hang_source_destroy_decoder(struct hang_source *ctx);
+static void hang_source_destroy_decoder_locked(struct hang_source *ctx);
 static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id);
 
 static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
@@ -100,12 +100,13 @@ static void hang_source_destroy(void *data)
 {
 	struct hang_source *ctx = (struct hang_source *)data;
 
-	hang_source_disconnect(ctx);
-	hang_source_destroy_decoder(ctx);
+	pthread_mutex_lock(&ctx->mutex);
+	hang_source_disconnect_locked(ctx);
+	pthread_mutex_unlock(&ctx->mutex);
 
 	bfree(ctx->url);
 	bfree(ctx->broadcast);
-	bfree(ctx->frame_buffer);
+	// Note: frame_buffer is already freed by hang_source_disconnect_locked
 
 	pthread_mutex_destroy(&ctx->mutex);
 
@@ -167,6 +168,14 @@ static void on_session_status(void *user_data, int32_t code)
 {
 	struct hang_source *ctx = (struct hang_source *)user_data;
 
+	// Check if we've been disconnected
+	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->session < 0) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+	pthread_mutex_unlock(&ctx->mutex);
+
 	if (code == 0) {
 		LOG_INFO("MoQ session connected successfully");
 		// Now that we're connected, start consuming the broadcast
@@ -184,8 +193,16 @@ static void on_catalog(void *user_data, int32_t catalog)
 
 	pthread_mutex_lock(&ctx->mutex);
 
-	// Check if this is still the current generation
+	// Check if this callback is still valid (not from a stale connection)
 	uint32_t current_gen = ctx->generation;
+	if (ctx->consume < 0) {
+		// We've been disconnected, ignore this callback
+		pthread_mutex_unlock(&ctx->mutex);
+		if (catalog >= 0)
+			moq_consume_catalog_close(catalog);
+		return;
+	}
+
 	pthread_mutex_unlock(&ctx->mutex);
 
 	if (catalog < 0) {
@@ -201,7 +218,7 @@ static void on_catalog(void *user_data, int32_t catalog)
 		return;
 	}
 
-	// Initialize decoder with the video config
+	// Initialize decoder with the video config (takes mutex internally)
 	if (!hang_source_init_decoder(ctx, &video_config)) {
 		LOG_ERROR("Failed to initialize decoder");
 		moq_consume_catalog_close(catalog);
@@ -221,6 +238,12 @@ static void on_catalog(void *user_data, int32_t catalog)
 	if (ctx->generation == current_gen) {
 		ctx->video_track = track;
 		ctx->catalog_handle = catalog;
+	} else {
+		// Generation changed while we were setting up, clean up the track
+		pthread_mutex_unlock(&ctx->mutex);
+		moq_consume_video_track_close(track);
+		moq_consume_catalog_close(catalog);
+		return;
 	}
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -236,7 +259,16 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 		return;
 	}
 
-	LOG_DEBUG("Received video frame: %d", frame_id);
+	// Check if this callback is still valid (not from a stale connection)
+	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->video_track < 0) {
+		// We've been disconnected, ignore this callback
+		pthread_mutex_unlock(&ctx->mutex);
+		moq_consume_frame_close(frame_id);
+		return;
+	}
+	pthread_mutex_unlock(&ctx->mutex);
+
 	hang_source_decode_frame(ctx, frame_id);
 }
 
@@ -248,7 +280,7 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	// Increment generation to invalidate old callbacks
 	pthread_mutex_lock(&ctx->mutex);
 	ctx->generation++;
-	hang_source_disconnect(ctx);
+	hang_source_disconnect_locked(ctx);
 	pthread_mutex_unlock(&ctx->mutex);
 
 	// Create origin for consuming
@@ -277,15 +309,27 @@ static void hang_source_reconnect(struct hang_source *ctx)
 // Called after session is connected successfully
 static void hang_source_start_consume(struct hang_source *ctx)
 {
+	// Check if origin is still valid
+	pthread_mutex_lock(&ctx->mutex);
+	if (ctx->origin < 0) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+	pthread_mutex_unlock(&ctx->mutex);
+
 	// Consume broadcast by path
-	ctx->consume = moq_origin_consume(ctx->origin, ctx->broadcast, strlen(ctx->broadcast));
-	if (ctx->consume < 0) {
-		LOG_ERROR("Failed to consume broadcast: %d", ctx->consume);
+	int32_t consume = moq_origin_consume(ctx->origin, ctx->broadcast, strlen(ctx->broadcast));
+	if (consume < 0) {
+		LOG_ERROR("Failed to consume broadcast: %d", consume);
 		return;
 	}
 
+	pthread_mutex_lock(&ctx->mutex);
+	ctx->consume = consume;
+	pthread_mutex_unlock(&ctx->mutex);
+
 	// Subscribe to catalog updates
-	int32_t catalog_handle = moq_consume_catalog(ctx->consume, on_catalog, ctx);
+	int32_t catalog_handle = moq_consume_catalog(consume, on_catalog, ctx);
 	if (catalog_handle < 0) {
 		LOG_ERROR("Failed to subscribe to catalog: %d", catalog_handle);
 		return;
@@ -294,7 +338,8 @@ static void hang_source_start_consume(struct hang_source *ctx)
 	LOG_INFO("Consuming broadcast: %s", ctx->broadcast);
 }
 
-static void hang_source_disconnect(struct hang_source *ctx)
+// NOTE: Caller must hold ctx->mutex when calling this function
+static void hang_source_disconnect_locked(struct hang_source *ctx)
 {
 	if (ctx->video_track >= 0) {
 		moq_consume_video_track_close(ctx->video_track);
@@ -321,81 +366,112 @@ static void hang_source_disconnect(struct hang_source *ctx)
 		ctx->origin = -1;
 	}
 
-	hang_source_destroy_decoder(ctx);
+	hang_source_destroy_decoder_locked(ctx);
 	ctx->got_keyframe = false;
 }
 
 static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_video_config *config)
 {
-	hang_source_destroy_decoder(ctx);
-
-	// Find H.264 decoder
+	// Find H.264 decoder (can be done outside mutex)
 	const AVCodec *codec = avcodec_find_decoder(AV_CODEC_ID_H264);
 	if (!codec) {
 		LOG_ERROR("H.264 codec not found");
 		return false;
 	}
 
-	// Create codec context
-	ctx->codec_ctx = avcodec_alloc_context3(codec);
-	if (!ctx->codec_ctx) {
+	// Create codec context (can be done outside mutex)
+	AVCodecContext *new_codec_ctx = avcodec_alloc_context3(codec);
+	if (!new_codec_ctx) {
 		LOG_ERROR("Failed to allocate codec context");
 		return false;
 	}
 
+	uint32_t width = FRAME_WIDTH;
+	uint32_t height = FRAME_HEIGHT;
+
 	// Set codec parameters from config
 	if (config->coded_width && *config->coded_width > 0) {
-		ctx->codec_ctx->width = *config->coded_width;
-		ctx->frame.width = *config->coded_width;
+		new_codec_ctx->width = *config->coded_width;
+		width = *config->coded_width;
 	}
 	if (config->coded_height && *config->coded_height > 0) {
-		ctx->codec_ctx->height = *config->coded_height;
-		ctx->frame.height = *config->coded_height;
+		new_codec_ctx->height = *config->coded_height;
+		height = *config->coded_height;
 	}
 
 	// Use codec description as extradata (contains SPS/PPS)
 	if (config->description && config->description_len > 0) {
-		ctx->codec_ctx->extradata = (uint8_t *)av_malloc(config->description_len + AV_INPUT_BUFFER_PADDING_SIZE);
-		if (ctx->codec_ctx->extradata) {
-			memcpy(ctx->codec_ctx->extradata, config->description, config->description_len);
-			ctx->codec_ctx->extradata_size = config->description_len;
+		new_codec_ctx->extradata = (uint8_t *)av_malloc(config->description_len + AV_INPUT_BUFFER_PADDING_SIZE);
+		if (new_codec_ctx->extradata) {
+			memcpy(new_codec_ctx->extradata, config->description, config->description_len);
+			new_codec_ctx->extradata_size = config->description_len;
 		}
 	}
 
 	// Open codec
-	if (avcodec_open2(ctx->codec_ctx, codec, NULL) < 0) {
+	if (avcodec_open2(new_codec_ctx, codec, NULL) < 0) {
 		LOG_ERROR("Failed to open codec");
-		hang_source_destroy_decoder(ctx);
+		avcodec_free_context(&new_codec_ctx);
 		return false;
 	}
 
 	// Allocate frame buffer (RGBA for OBS)
-	ctx->frame.linesize[0] = ctx->frame.width * 4;
-	size_t buffer_size = ctx->frame.width * ctx->frame.height * 4;
-	ctx->frame_buffer = (uint8_t *)bmalloc(buffer_size);
-	ctx->frame.data[0] = ctx->frame_buffer;
-
-	// Create scaling context for YUV420P -> RGBA conversion
-	ctx->sws_ctx = sws_getContext(
-		ctx->frame.width, ctx->frame.height, AV_PIX_FMT_YUV420P,
-		ctx->frame.width, ctx->frame.height, AV_PIX_FMT_RGBA,
-		SWS_BILINEAR, NULL, NULL, NULL
-	);
-
-	if (!ctx->sws_ctx) {
-		LOG_ERROR("Failed to create scaling context");
-		hang_source_destroy_decoder(ctx);
+	size_t buffer_size = width * height * 4;
+	uint8_t *new_frame_buffer = (uint8_t *)bmalloc(buffer_size);
+	if (!new_frame_buffer) {
+		LOG_ERROR("Failed to allocate frame buffer");
+		avcodec_free_context(&new_codec_ctx);
 		return false;
 	}
 
+	// Create scaling context for YUV420P -> RGBA conversion
+	struct SwsContext *new_sws_ctx = sws_getContext(
+		width, height, AV_PIX_FMT_YUV420P,
+		width, height, AV_PIX_FMT_RGBA,
+		SWS_BILINEAR, NULL, NULL, NULL
+	);
+
+	if (!new_sws_ctx) {
+		LOG_ERROR("Failed to create scaling context");
+		bfree(new_frame_buffer);
+		avcodec_free_context(&new_codec_ctx);
+		return false;
+	}
+
+	// Now take the mutex and swap in the new decoder state
+	pthread_mutex_lock(&ctx->mutex);
+
+	// Destroy old decoder state
+	if (ctx->sws_ctx) {
+		sws_freeContext(ctx->sws_ctx);
+	}
+	if (ctx->codec_ctx) {
+		avcodec_free_context(&ctx->codec_ctx);
+	}
+	if (ctx->frame_buffer) {
+		bfree(ctx->frame_buffer);
+	}
+
+	// Install new decoder state
+	ctx->codec_ctx = new_codec_ctx;
+	ctx->sws_ctx = new_sws_ctx;
+	ctx->frame_buffer = new_frame_buffer;
+	ctx->frame.width = width;
+	ctx->frame.height = height;
+	ctx->frame.linesize[0] = width * 4;
+	ctx->frame.data[0] = new_frame_buffer;
 	ctx->frame.format = VIDEO_FORMAT_RGBA;
 	ctx->frame.timestamp = 0;
+	ctx->got_keyframe = false;
 
-	LOG_INFO("Decoder initialized: %dx%d", ctx->frame.width, ctx->frame.height);
+	pthread_mutex_unlock(&ctx->mutex);
+
+	LOG_INFO("Decoder initialized: %dx%d", width, height);
 	return true;
 }
 
-static void hang_source_destroy_decoder(struct hang_source *ctx)
+// NOTE: Caller must hold ctx->mutex when calling this function
+static void hang_source_destroy_decoder_locked(struct hang_source *ctx)
 {
 	if (ctx->sws_ctx) {
 		sws_freeContext(ctx->sws_ctx);
@@ -410,18 +486,26 @@ static void hang_source_destroy_decoder(struct hang_source *ctx)
 	if (ctx->frame_buffer) {
 		bfree(ctx->frame_buffer);
 		ctx->frame_buffer = NULL;
+		ctx->frame.data[0] = NULL;
 	}
 }
 
 static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 {
-	if (!ctx->codec_ctx)
+	pthread_mutex_lock(&ctx->mutex);
+
+	// Check if decoder is still valid (may have been destroyed during reconnect)
+	if (!ctx->codec_ctx || !ctx->sws_ctx || !ctx->frame_buffer) {
+		pthread_mutex_unlock(&ctx->mutex);
+		moq_consume_frame_close(frame_id);
 		return;
+	}
 
 	// Get frame data
 	struct moq_frame frame_data;
 	if (moq_consume_frame_chunk(frame_id, 0, &frame_data) < 0) {
 		LOG_ERROR("Failed to get frame data");
+		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -429,6 +513,7 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 	// Skip non-keyframes until we get the first one
 	if (!ctx->got_keyframe && !frame_data.keyframe) {
 		LOG_DEBUG("Skipping non-keyframe before first keyframe");
+		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -442,6 +527,7 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 	// Create AVPacket from frame data
 	AVPacket *packet = av_packet_alloc();
 	if (!packet) {
+		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -461,6 +547,7 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 			av_strerror(ret, errbuf, sizeof(errbuf));
 			LOG_ERROR("Error sending packet to decoder: %s", errbuf);
 		}
+		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -468,6 +555,7 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 	// Receive decoded frames
 	AVFrame *frame = av_frame_alloc();
 	if (!frame) {
+		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -480,6 +568,7 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 			LOG_ERROR("Error receiving frame from decoder: %s", errbuf);
 		}
 		av_frame_free(&frame);
+		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
 	}
@@ -495,9 +584,8 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 	ctx->frame.timestamp = frame_data.timestamp_us;
 	obs_source_output_video(ctx->source, &ctx->frame);
 
-	LOG_DEBUG("Output video frame: %dx%d ts=%llu", ctx->frame.width, ctx->frame.height, (unsigned long long)ctx->frame.timestamp);
-
 	av_frame_free(&frame);
+	pthread_mutex_unlock(&ctx->mutex);
 	moq_consume_frame_close(frame_id);
 }
 
