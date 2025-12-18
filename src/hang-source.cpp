@@ -20,9 +20,15 @@ extern "C" {
 struct hang_source {
 	obs_source_t *source;
 
-	// Settings
+	// Settings - current active connection settings
 	char *url;
 	char *broadcast;
+
+	// Pending settings - what user has typed but not yet applied
+	char *pending_url;
+	char *pending_broadcast;
+	uint64_t settings_changed_time;  // Timestamp when settings last changed
+	bool reconnect_pending;          // True if we need to reconnect after debounce
 
 	// Session handles (all negative = invalid)
 	volatile uint32_t generation;  // Increments on reconnect
@@ -36,6 +42,7 @@ struct hang_source {
 	AVCodecContext *codec_ctx;
 	struct SwsContext *sws_ctx;
 	bool got_keyframe;
+	uint32_t frames_waiting_for_keyframe;  // Count of skipped frames while waiting
 
 	// Output frame buffer
 	struct obs_source_frame frame;
@@ -45,9 +52,13 @@ struct hang_source {
 	pthread_mutex_t mutex;
 };
 
+// Debounce delay in milliseconds (500ms = user stops typing for half a second)
+#define DEBOUNCE_DELAY_MS 500
+
 // Forward declarations
 static void hang_source_update(void *data, obs_data_t *settings);
 static void hang_source_destroy(void *data);
+static void hang_source_video_tick(void *data, float seconds);
 static obs_properties_t *hang_source_properties(void *data);
 static void hang_source_get_defaults(obs_data_t *settings);
 
@@ -59,6 +70,7 @@ static void on_video_frame(void *user_data, int32_t frame_id);
 // Helper functions
 static void hang_source_reconnect(struct hang_source *ctx);
 static void hang_source_disconnect_locked(struct hang_source *ctx);
+static void hang_source_blank_video(struct hang_source *ctx);
 static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_video_config *config);
 static void hang_source_destroy_decoder_locked(struct hang_source *ctx);
 static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id);
@@ -67,6 +79,12 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 {
 	struct hang_source *ctx = (struct hang_source *)bzalloc(sizeof(struct hang_source));
 	ctx->source = source;
+
+	// Initialize pending settings
+	ctx->pending_url = NULL;
+	ctx->pending_broadcast = NULL;
+	ctx->settings_changed_time = 0;
+	ctx->reconnect_pending = false;
 
 	// Initialize handles to invalid values
 	ctx->generation = 0;
@@ -80,6 +98,7 @@ static void *hang_source_create(obs_data_t *settings, obs_source_t *source)
 	ctx->codec_ctx = NULL;
 	ctx->sws_ctx = NULL;
 	ctx->got_keyframe = false;
+	ctx->frames_waiting_for_keyframe = 0;
 	ctx->frame_buffer = NULL;
 
 	// Initialize threading
@@ -106,6 +125,8 @@ static void hang_source_destroy(void *data)
 
 	bfree(ctx->url);
 	bfree(ctx->broadcast);
+	bfree(ctx->pending_url);
+	bfree(ctx->pending_broadcast);
 	// Note: frame_buffer is already freed by hang_source_disconnect_locked
 
 	pthread_mutex_destroy(&ctx->mutex);
@@ -120,32 +141,33 @@ static void hang_source_update(void *data, obs_data_t *settings)
 	const char *url = obs_data_get_string(settings, "url");
 	const char *broadcast = obs_data_get_string(settings, "broadcast");
 
-	bool changed = false;
-	bool should_reconnect = false;
-
 	pthread_mutex_lock(&ctx->mutex);
 
-	if (!ctx->url || strcmp(ctx->url, url) != 0) {
-		bfree(ctx->url);
-		ctx->url = bstrdup(url);
-		changed = true;
+	// Check if pending settings have changed
+	bool pending_changed = false;
+	
+	if (!ctx->pending_url || strcmp(ctx->pending_url, url) != 0) {
+		bfree(ctx->pending_url);
+		ctx->pending_url = bstrdup(url);
+		pending_changed = true;
 	}
 
-	if (!ctx->broadcast || strcmp(ctx->broadcast, broadcast) != 0) {
-		bfree(ctx->broadcast);
-		ctx->broadcast = bstrdup(broadcast);
-		changed = true;
+	if (!ctx->pending_broadcast || strcmp(ctx->pending_broadcast, broadcast) != 0) {
+		bfree(ctx->pending_broadcast);
+		ctx->pending_broadcast = bstrdup(broadcast);
+		pending_changed = true;
 	}
 
-	if (changed && ctx->url && ctx->broadcast && strlen(ctx->url) > 0 && strlen(ctx->broadcast) > 0) {
-		should_reconnect = true;
+	if (pending_changed) {
+		// Record the time of this change and mark reconnect as pending
+		// The actual reconnect will happen in video_tick after debounce delay
+		ctx->settings_changed_time = os_gettime_ns();
+		ctx->reconnect_pending = true;
+		LOG_DEBUG("Settings changed, scheduling reconnect after debounce (url=%s, broadcast=%s)", 
+		          url ? url : "(null)", broadcast ? broadcast : "(null)");
 	}
 
 	pthread_mutex_unlock(&ctx->mutex);
-
-	if (should_reconnect) {
-		hang_source_reconnect(ctx);
-	}
 }
 
 static void hang_source_get_defaults(obs_data_t *settings)
@@ -166,8 +188,69 @@ static obs_properties_t *hang_source_properties(void *data)
 	return props;
 }
 
-// Note: We use OBS_SOURCE_ASYNC_VIDEO, so OBS handles rendering automatically
-// via obs_source_output_video(). No video_tick or video_render callbacks needed.
+// video_tick handles debounced reconnection - waits for user to stop typing
+static void hang_source_video_tick(void *data, float seconds)
+{
+	UNUSED_PARAMETER(seconds);
+	struct hang_source *ctx = (struct hang_source *)data;
+
+	pthread_mutex_lock(&ctx->mutex);
+
+	if (!ctx->reconnect_pending) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+
+	// Check if enough time has passed since last settings change (debounce)
+	uint64_t now = os_gettime_ns();
+	uint64_t elapsed_ms = (now - ctx->settings_changed_time) / 1000000;
+
+	if (elapsed_ms < DEBOUNCE_DELAY_MS) {
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+
+	// Debounce period elapsed - time to apply the pending settings
+	ctx->reconnect_pending = false;
+
+	// Check if pending settings differ from current active settings
+	bool url_changed = (!ctx->url && ctx->pending_url) ||
+	                   (ctx->url && !ctx->pending_url) ||
+	                   (ctx->url && ctx->pending_url && strcmp(ctx->url, ctx->pending_url) != 0);
+	bool broadcast_changed = (!ctx->broadcast && ctx->pending_broadcast) ||
+	                         (ctx->broadcast && !ctx->pending_broadcast) ||
+	                         (ctx->broadcast && ctx->pending_broadcast && strcmp(ctx->broadcast, ctx->pending_broadcast) != 0);
+
+	if (!url_changed && !broadcast_changed) {
+		// No actual change from current active connection
+		pthread_mutex_unlock(&ctx->mutex);
+		return;
+	}
+
+	// Apply pending settings as the new active settings
+	bfree(ctx->url);
+	ctx->url = ctx->pending_url ? bstrdup(ctx->pending_url) : NULL;
+	bfree(ctx->broadcast);
+	ctx->broadcast = ctx->pending_broadcast ? bstrdup(ctx->pending_broadcast) : NULL;
+
+	// Check if the new settings are valid
+	bool valid = ctx->url && ctx->broadcast && strlen(ctx->url) > 0 && strlen(ctx->broadcast) > 0;
+
+	if (!valid) {
+		// Invalid settings - disconnect and blank video
+		LOG_INFO("Invalid URL or broadcast - disconnecting and blanking video");
+		hang_source_disconnect_locked(ctx);
+		pthread_mutex_unlock(&ctx->mutex);
+		hang_source_blank_video(ctx);
+		return;
+	}
+
+	pthread_mutex_unlock(&ctx->mutex);
+
+	// Valid settings - reconnect
+	LOG_INFO("Debounce complete, reconnecting to %s / %s", ctx->url, ctx->broadcast);
+	hang_source_reconnect(ctx);
+}
 
 // Forward declaration for use in callback
 static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected_gen);
@@ -192,6 +275,8 @@ static void on_session_status(void *user_data, int32_t code)
 		hang_source_start_consume(ctx, current_gen);
 	} else {
 		LOG_ERROR("MoQ session failed with code: %d", code);
+		// Connection failed - blank the video to show error state
+		hang_source_blank_video(ctx);
 	}
 }
 
@@ -217,6 +302,8 @@ static void on_catalog(void *user_data, int32_t catalog)
 
 	if (catalog < 0) {
 		LOG_ERROR("Failed to get catalog: %d", catalog);
+		// Catalog failed (likely invalid broadcast) - blank video
+		hang_source_blank_video(ctx);
 		return;
 	}
 
@@ -269,9 +356,11 @@ static void on_video_frame(void *user_data, int32_t frame_id)
 		return;
 	}
 
-	// Check if this callback is still valid (not from a stale connection)
+	// Check if this callback is still valid using generation (not video_track)
+	// Note: We can't check video_track here because frames may arrive before
+	// the track handle is stored in on_catalog (race condition)
 	pthread_mutex_lock(&ctx->mutex);
-	if (ctx->video_track < 0) {
+	if (ctx->consume < 0) {
 		// We've been disconnected, ignore this callback
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
@@ -296,11 +385,15 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	char *url_copy = bstrdup(ctx->url);
 	pthread_mutex_unlock(&ctx->mutex);
 
+	// Blank video while reconnecting to avoid showing stale frames
+	hang_source_blank_video(ctx);
+
 	// Create origin for consuming (outside mutex since it may block)
 	int32_t new_origin = moq_origin_create();
 	if (new_origin < 0) {
 		LOG_ERROR("Failed to create origin: %d", new_origin);
 		bfree(url_copy);
+		// Video already blanked at start of reconnect
 		return;
 	}
 
@@ -316,6 +409,7 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	if (new_session < 0) {
 		LOG_ERROR("Failed to connect to MoQ server: %d", new_session);
 		moq_origin_close(new_origin);
+		// Video already blanked at start of reconnect
 		return;
 	}
 
@@ -356,6 +450,8 @@ static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected
 	if (consume < 0) {
 		LOG_ERROR("Failed to consume broadcast: %d", consume);
 		bfree(broadcast_copy);
+		// Failed to consume (invalid broadcast path) - blank video
+		hang_source_blank_video(ctx);
 		return;
 	}
 
@@ -376,6 +472,8 @@ static void hang_source_start_consume(struct hang_source *ctx, uint32_t expected
 	if (catalog_handle < 0) {
 		LOG_ERROR("Failed to subscribe to catalog: %d", catalog_handle);
 		bfree(broadcast_copy);
+		// Failed to get catalog - blank video
+		hang_source_blank_video(ctx);
 		return;
 	}
 
@@ -413,6 +511,15 @@ static void hang_source_disconnect_locked(struct hang_source *ctx)
 
 	hang_source_destroy_decoder_locked(ctx);
 	ctx->got_keyframe = false;
+	ctx->frames_waiting_for_keyframe = 0;
+}
+
+// Blanks the video preview by outputting a NULL frame
+static void hang_source_blank_video(struct hang_source *ctx)
+{
+	// Passing NULL to obs_source_output_video clears the current frame
+	obs_source_output_video(ctx->source, NULL);
+	LOG_DEBUG("Video preview blanked");
 }
 
 static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_video_config *config)
@@ -508,6 +615,7 @@ static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_v
 	ctx->frame.format = VIDEO_FORMAT_RGBA;
 	ctx->frame.timestamp = 0;
 	ctx->got_keyframe = false;
+	ctx->frames_waiting_for_keyframe = 0;
 
 	pthread_mutex_unlock(&ctx->mutex);
 
@@ -557,7 +665,12 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 
 	// Skip non-keyframes until we get the first one
 	if (!ctx->got_keyframe && !frame_data.keyframe) {
-		LOG_DEBUG("Skipping non-keyframe before first keyframe");
+		ctx->frames_waiting_for_keyframe++;
+		if (ctx->frames_waiting_for_keyframe == 1 || 
+		    (ctx->frames_waiting_for_keyframe % 30) == 0) {
+			LOG_INFO("Waiting for keyframe... (skipped %u frames so far)", 
+			         ctx->frames_waiting_for_keyframe);
+		}
 		pthread_mutex_unlock(&ctx->mutex);
 		moq_consume_frame_close(frame_id);
 		return;
@@ -565,8 +678,12 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 
 	// Mark that we've received a keyframe from the stream
 	if (frame_data.keyframe) {
+		if (!ctx->got_keyframe) {
+			LOG_INFO("Got keyframe after waiting for %u frames, payload_size=%zu", 
+			         ctx->frames_waiting_for_keyframe, frame_data.payload_size);
+		}
 		ctx->got_keyframe = true;
-		LOG_INFO("Received keyframe, payload_size=%zu", frame_data.payload_size);
+		ctx->frames_waiting_for_keyframe = 0;
 	}
 
 	// Create AVPacket from frame data
@@ -649,8 +766,8 @@ void register_hang_source()
 	info.update = hang_source_update;
 	info.get_defaults = hang_source_get_defaults;
 	info.get_properties = hang_source_properties;
-	// Note: No video_tick or video_render needed for async video sources
-	// OBS handles rendering via obs_source_output_video()
+	// video_tick is needed for debounced reconnection (blur simulation)
+	info.video_tick = hang_source_video_tick;
 
 	obs_register_source(&info);
 }
