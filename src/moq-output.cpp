@@ -13,9 +13,9 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 	  path(),
 	  total_bytes_sent(0),
 	  connect_time_ms(0),
-	  origin(0),
-	  session(0),
+	  origin(moq_origin_create()),
 	  broadcast(moq_publish_create()),
+	  session(0),
 	  video(0),
 	  audio(0)
 {
@@ -24,6 +24,7 @@ MoQOutput::MoQOutput(obs_data_t *, obs_output_t *output)
 MoQOutput::~MoQOutput()
 {
 	moq_publish_close(broadcast);
+	moq_origin_close(origin);
 
 	Stop();
 }
@@ -81,28 +82,21 @@ bool MoQOutput::Start()
 		}
 	};
 
-	// Create an origin for publishing
-	origin = moq_origin_create();
-	if (origin < 0) {
-		LOG_ERROR("Failed to create origin: %d", origin);
+	// Start establishing a session with the MoQ server
+	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
+	session = moq_session_connect(server_url.data(), server_url.size(), origin, 0, session_connect_callback, this);
+	if (session < 0) {
+		LOG_ERROR("Failed to initialize MoQ server: %d", session);
 		return false;
 	}
 
 	LOG_INFO("Publishing broadcast: %s", path.c_str());
 
-	// Publish the broadcast to the origin before connecting
-	// NOTE: You could publish multiple broadcasts to the same origin if you want (multi ingest).
-	auto result = moq_origin_publish(origin, path.c_str(), path.length(), broadcast);
+	// Publish the broadcast to the origin we created.
+	// TODO: There is currently no unpublish function.
+	auto result = moq_origin_publish(origin, path.data(), path.size(), broadcast);
 	if (result < 0) {
-		LOG_ERROR("Failed to publish broadcast to origin: %d", result);
-		return false;
-	}
-
-	// Start establishing a session with the MoQ server
-	// NOTE: You could publish the same broadcasts to multiple sessions if you want (redundant ingest).
-	session = moq_session_connect(server_url.c_str(), server_url.length(), origin, 0, session_connect_callback, this);
-	if (session < 0) {
-		LOG_ERROR("Failed to initialize MoQ server: %d", session);
+		LOG_ERROR("Failed to publish broadcast to session: %d", result);
 		return false;
 	}
 
@@ -113,27 +107,17 @@ bool MoQOutput::Start()
 
 void MoQOutput::Stop(bool signal)
 {
-	// Close media tracks
+	// Close the session
+	if (session > 0) {
+		moq_session_close(session);
+	}
+
 	if (video > 0) {
 		moq_publish_media_close(video);
-		video = 0;
 	}
 
 	if (audio > 0) {
 		moq_publish_media_close(audio);
-		audio = 0;
-	}
-
-	// Close the session
-	if (session > 0) {
-		moq_session_close(session);
-		session = 0;
-	}
-
-	// Close the origin
-	if (origin > 0) {
-		moq_origin_close(origin);
-		origin = 0;
 	}
 
 	if (signal) {
@@ -232,6 +216,7 @@ void MoQOutput::VideoInit()
 	}
 
 	const char *codec = obs_encoder_get_codec(encoder);
+
 	video = moq_publish_media_ordered(broadcast, codec, strlen(codec), extra_data, extra_size);
 	if (video < 0) {
 		LOG_ERROR("Failed to initialize video track: %d", video);
@@ -270,6 +255,7 @@ void MoQOutput::AudioInit()
 	}
 
 	const char *codec = obs_encoder_get_codec(encoder);
+
 	audio = moq_publish_media_ordered(broadcast, codec, strlen(codec), extra_data, extra_size);
 	if (audio < 0) {
 		LOG_ERROR("Failed to initialize audio track: %d", audio);

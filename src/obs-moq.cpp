@@ -36,6 +36,7 @@ MODULE_EXPORT const char *obs_module_description(void)
 bool obs_module_load(void)
 {
 	// Use RUST_LOG env var for more verbose output
+	// The second argument is the string length of the first argument.
 	moq_log_level("info", 4);
 
 	register_moq_output();
