@@ -4,6 +4,8 @@
 #include <util/darray.h>
 #include <util/dstr.h>
 
+#include <atomic>
+
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavutil/imgutils.h>
@@ -31,10 +33,10 @@ struct hang_source {
 	bool reconnect_pending;          // True if we need to reconnect after debounce
 
 	// Shutdown flag - set when destroy begins, callbacks should exit early
-	volatile bool shutting_down;
+	std::atomic<bool> shutting_down;
 
 	// Session handles (all negative = invalid)
-	volatile uint32_t generation;  // Increments on reconnect
+	std::atomic<uint32_t> generation;  // Increments on reconnect
 	bool reconnect_in_progress;    // True while reconnect is happening
 	int32_t origin;
 	int32_t session;
@@ -135,8 +137,20 @@ static void hang_source_destroy(void *data)
 	hang_source_disconnect_locked(ctx);
 	pthread_mutex_unlock(&ctx->mutex);
 
-	// Give MoQ callbacks time to drain - they check shutting_down and exit early
-	// This prevents use-after-free when async callbacks fire after ctx is freed
+	// Give MoQ callbacks time to drain - they check shutting_down and exit early.
+	// This prevents use-after-free when async callbacks fire after ctx is freed.
+	//
+	// LIMITATION: This 100ms sleep is a timing-based workaround, not a synchronization
+	// guarantee. If a callback is mid-execution when shutting_down is set AND takes
+	// longer than 100ms to complete (after the mutex unlock), there is still a
+	// potential race condition. In practice, our callbacks are fast (< 1ms typically)
+	// and this delay provides sufficient margin. However, a more robust solution
+	// would use reference counting:
+	//   - Increment refcount when entering a callback
+	//   - Decrement when exiting
+	//   - Wait for refcount to reach zero before freeing ctx
+	// This could be implemented using std::shared_ptr or a manual atomic refcount
+	// with a condition variable for waiting.
 	os_sleep_ms(100);
 
 	bfree(ctx->url);
@@ -267,10 +281,16 @@ static void hang_source_video_tick(void *data, float seconds)
 		return;
 	}
 
+	// Copy url and broadcast while holding mutex to avoid race condition in LOG_INFO
+	char *url_for_log = bstrdup(ctx->url);
+	char *broadcast_for_log = bstrdup(ctx->broadcast);
+
 	pthread_mutex_unlock(&ctx->mutex);
 
 	// Valid settings - reconnect
-	LOG_INFO("Debounce complete, reconnecting to %s / %s", ctx->url, ctx->broadcast);
+	LOG_INFO("Debounce complete, reconnecting to %s / %s", url_for_log, broadcast_for_log);
+	bfree(url_for_log);
+	bfree(broadcast_for_log);
 	hang_source_reconnect(ctx);
 }
 
@@ -441,9 +461,9 @@ static void hang_source_reconnect(struct hang_source *ctx)
 	}
 	
 	ctx->reconnect_in_progress = true;
-	uint32_t new_gen = ctx->generation + 1;
-	LOG_INFO("Reconnecting (generation %u -> %u)", ctx->generation, new_gen);
-	ctx->generation = new_gen;
+	uint32_t new_gen = ctx->generation.load() + 1;
+	LOG_INFO("Reconnecting (generation %u -> %u)", ctx->generation.load(), new_gen);
+	ctx->generation.store(new_gen);
 	hang_source_disconnect_locked(ctx);
 
 	// Copy URL while holding mutex for thread safety
@@ -656,7 +676,7 @@ static bool hang_source_init_decoder(struct hang_source *ctx, const struct moq_v
 
 	// Use codec description as extradata (contains SPS/PPS)
 	if (config->description && config->description_len > 0) {
-		new_codec_ctx->extradata = (uint8_t *)av_malloc(config->description_len + AV_INPUT_BUFFER_PADDING_SIZE);
+		new_codec_ctx->extradata = (uint8_t *)av_mallocz(config->description_len + AV_INPUT_BUFFER_PADDING_SIZE);
 		if (new_codec_ctx->extradata) {
 			memcpy(new_codec_ctx->extradata, config->description, config->description_len);
 			new_codec_ctx->extradata_size = config->description_len;
@@ -874,6 +894,71 @@ static void hang_source_decode_frame(struct hang_source *ctx, int32_t frame_id)
 	
 	// Successfully decoded a frame - reset error counter
 	ctx->consecutive_decode_errors = 0;
+
+	// Validate decoded frame dimensions against ctx->frame and reinitialize if they differ
+	// This prevents OOB reads/writes when the stream resolution changes mid-stream
+	if (frame->width != (int)ctx->frame.width || frame->height != (int)ctx->frame.height) {
+		LOG_INFO("Decoded frame dimensions changed: %dx%d -> %dx%d, reinitializing scaler",
+		         ctx->frame.width, ctx->frame.height, frame->width, frame->height);
+
+		// Validate that dimensions are positive and reasonable
+		if (frame->width <= 0 || frame->height <= 0 ||
+		    frame->width > 16384 || frame->height > 16384) {
+			LOG_ERROR("Invalid decoded frame dimensions: %dx%d", frame->width, frame->height);
+			av_frame_free(&frame);
+			pthread_mutex_unlock(&ctx->mutex);
+			moq_consume_frame_close(frame_id);
+			return;
+		}
+
+		// Free old sws context
+		if (ctx->sws_ctx) {
+			sws_freeContext(ctx->sws_ctx);
+			ctx->sws_ctx = NULL;
+		}
+
+		// Create new scaling context with the new dimensions
+		struct SwsContext *new_sws_ctx = sws_getContext(
+			frame->width, frame->height, AV_PIX_FMT_YUV420P,
+			frame->width, frame->height, AV_PIX_FMT_RGBA,
+			SWS_BILINEAR, NULL, NULL, NULL
+		);
+		if (!new_sws_ctx) {
+			LOG_ERROR("Failed to create scaling context for %dx%d", frame->width, frame->height);
+			av_frame_free(&frame);
+			pthread_mutex_unlock(&ctx->mutex);
+			moq_consume_frame_close(frame_id);
+			return;
+		}
+
+		// Reallocate frame buffer for new dimensions (width * height * 4 for RGBA)
+		size_t new_buffer_size = (size_t)frame->width * (size_t)frame->height * 4;
+		uint8_t *new_frame_buffer = (uint8_t *)bmalloc(new_buffer_size);
+		if (!new_frame_buffer) {
+			LOG_ERROR("Failed to allocate frame buffer for %dx%d (%zu bytes)",
+			          frame->width, frame->height, new_buffer_size);
+			sws_freeContext(new_sws_ctx);
+			av_frame_free(&frame);
+			pthread_mutex_unlock(&ctx->mutex);
+			moq_consume_frame_close(frame_id);
+			return;
+		}
+
+		// Free old frame buffer
+		if (ctx->frame_buffer) {
+			bfree(ctx->frame_buffer);
+		}
+
+		// Install new state
+		ctx->sws_ctx = new_sws_ctx;
+		ctx->frame_buffer = new_frame_buffer;
+		ctx->frame.width = frame->width;
+		ctx->frame.height = frame->height;
+		ctx->frame.linesize[0] = frame->width * 4;
+		ctx->frame.data[0] = new_frame_buffer;
+
+		LOG_INFO("Scaler reinitialized for %dx%d", frame->width, frame->height);
+	}
 
 	// Convert YUV420P to RGBA
 	uint8_t *dst_data[4] = {ctx->frame_buffer, NULL, NULL, NULL};
