@@ -273,8 +273,8 @@ void register_moq_output()
 	const uint32_t base_flags = OBS_OUTPUT_ENCODED | OBS_OUTPUT_SERVICE;
 
 	const char *audio_codecs = "aac;opus";
-	// TODO: Add support for other codecs.
-	const char *video_codecs = "h264";
+	// TODO: Add support for AV1, VP9.
+	const char *video_codecs = "h264;hevc";
 
 	struct obs_output_info info = {};
 	info.id = "moq_output";
