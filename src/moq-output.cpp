@@ -220,7 +220,18 @@ void MoQOutput::VideoInit()
 
 	const char *codec = obs_encoder_get_codec(encoder);
 
-	video = moq_publish_media_ordered(broadcast, codec, strlen(codec), extra_data, extra_size);
+	// Transform codec string for MoQ
+	const char *moq_codec = codec;
+	if (strcmp(codec, "h264") == 0) {
+		// H.264 with inline SPS/PPS
+		moq_codec = "avc3";
+	} else if (strcmp(codec, "hevc") == 0) {
+		// H.265 with inline VPS/SPS/PPS
+		moq_codec = "hev1";
+	}
+
+	// Intialize the media import module with the codec and initialization data.
+	video = moq_publish_media_ordered(broadcast, moq_codec, strlen(moq_codec), extra_data, extra_size);
 	if (video < 0) {
 		LOG_ERROR("Failed to initialize video track: %d", video);
 		return;
