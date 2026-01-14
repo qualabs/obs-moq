@@ -13,7 +13,7 @@ include(helpers)
 
 add_library(obs-moq MODULE)
 
-if(NOT ${BUILD_PLUGIN})
+if(NOT BUILD_PLUGIN)
   find_package(libobs REQUIRED)
 endif()
 target_link_libraries(obs-moq PRIVATE OBS::libobs)
@@ -27,7 +27,8 @@ else()
   include(FetchContent)
   FetchContent_Declare(
     moq
-    URL https://github.com/moq-dev/moq/releases/download/libmoq-v${MOQ_VERSION}/moq-${MOQ_VERSION}-${MOQ_TARGET}.${MOQ_ARCHIVE}
+    URL
+      https://github.com/moq-dev/moq/releases/download/libmoq-v${MOQ_VERSION}/moq-${MOQ_VERSION}-${MOQ_TARGET}.${MOQ_ARCHIVE}
   )
   FetchContent_MakeAvailable(moq)
 
@@ -44,11 +45,11 @@ if(ENABLE_QT)
   find_package(Qt6 COMPONENTS Widgets Core)
   target_link_libraries(obs-moq PRIVATE Qt6::Core Qt6::Widgets)
   target_compile_options(
-    ${CMAKE_PROJECT_NAME}
+    obs-moq
     PRIVATE $<$<C_COMPILER_ID:Clang,AppleClang>:-Wno-quoted-include-in-framework-header -Wno-comma>
   )
   set_target_properties(
-    ${CMAKE_PROJECT_NAME}
+    obs-moq
     PROPERTIES AUTOMOC ON AUTOUIC ON AUTORCC ON
   )
 endif()
@@ -62,11 +63,17 @@ target_link_libraries(obs-moq PRIVATE ${FFMPEG_LIBRARIES})
 
 target_sources(
   obs-moq
-  PRIVATE src/obs-moq.cpp src/moq-output.h src/moq-service.h src/moq-output.cpp src/moq-service.cpp
-          src/moq-source.cpp src/moq-source.h
+  PRIVATE
+    src/obs-moq.cpp
+    src/moq-output.h
+    src/moq-service.h
+    src/moq-output.cpp
+    src/moq-service.cpp
+    src/moq-source.cpp
+    src/moq-source.h
 )
 
-if(${BUILD_PLUGIN})
+if(BUILD_PLUGIN)
   set_target_properties_plugin(obs-moq PROPERTIES OUTPUT_NAME ${_name})
 else()
   set_target_properties_obs(obs-moq PROPERTIES FOLDER plugins PREFIX "")
